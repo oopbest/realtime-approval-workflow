@@ -1,10 +1,13 @@
+console.log('[START] server.js initialized');
 // Custom WebSocket server integrated with Next.js
 // Uses 'noServer' mode to avoid conflicts with Next.js HMR WebSocket
+// Uses Prisma + SQLite for persistent data storage
 const { createServer } = require('http');
 const { parse } = require('url');
 const next = require('next');
 const { WebSocketServer } = require('ws');
-const { v4: uuidv4 } = require('uuid');
+const { PrismaClient } = require('@prisma/client');
+const { PrismaBetterSqlite3 } = require('@prisma/adapter-better-sqlite3');
 
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = 'localhost';
@@ -13,8 +16,9 @@ const port = parseInt(process.env.PORT || '3000', 10);
 const app = next({ dev, hostname, port });
 const handle = app.getRequestHandler();
 
-// In-memory store
-const requests = [];
+// Prisma Client with better-sqlite3 driver adapter (Prisma 7)
+const adapter = new PrismaBetterSqlite3({ url: 'file:./dev.db' });
+const prisma = new PrismaClient({ adapter });
 
 // Track connected clients
 const clients = new Map(); // Map<WebSocket, { userId, userName, role }>
@@ -26,11 +30,11 @@ app.prepare().then(() => {
 
       // API: GET /api/requests
       if (parsedUrl.pathname === '/api/requests' && req.method === 'GET') {
+        const allRequests = await prisma.approvalRequest.findMany({
+          orderBy: { createdAt: 'desc' },
+        });
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        const sorted = [...requests].sort(
-          (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
-        );
-        res.end(JSON.stringify(sorted));
+        res.end(JSON.stringify(allRequests));
         return;
       }
 
@@ -38,19 +42,16 @@ app.prepare().then(() => {
       if (parsedUrl.pathname === '/api/requests' && req.method === 'POST') {
         let body = '';
         req.on('data', (chunk) => (body += chunk));
-        req.on('end', () => {
+        req.on('end', async () => {
           const data = JSON.parse(body);
-          const newRequest = {
-            id: uuidv4(),
-            title: data.title,
-            description: data.description,
-            amount: data.amount,
-            status: 'pending',
-            createdBy: data.createdBy,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-          };
-          requests.push(newRequest);
+          const newRequest = await prisma.approvalRequest.create({
+            data: {
+              title: data.title,
+              description: data.description,
+              amount: data.amount,
+              createdBy: data.createdBy,
+            },
+          });
           res.writeHead(201, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(newRequest));
         });
@@ -62,22 +63,20 @@ app.prepare().then(() => {
       if (patchMatch && req.method === 'PATCH') {
         let body = '';
         req.on('data', (chunk) => (body += chunk));
-        req.on('end', () => {
+        req.on('end', async () => {
           const data = JSON.parse(body);
           const id = patchMatch[1];
-          const index = requests.findIndex((r) => r.id === id);
-          if (index === -1) {
+          try {
+            const updated = await prisma.approvalRequest.update({
+              where: { id },
+              data,
+            });
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(updated));
+          } catch (err) {
             res.writeHead(404, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'Request not found' }));
-            return;
           }
-          requests[index] = {
-            ...requests[index],
-            ...data,
-            updatedAt: new Date().toISOString(),
-          };
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(requests[index]));
         });
         return;
       }
@@ -94,28 +93,24 @@ app.prepare().then(() => {
   // ========================================
   // WebSocket Server Setup (noServer mode)
   // ========================================
-  // Using noServer: true so we can manually handle upgrade events
-  // and avoid conflicts with Next.js HMR WebSocket
   const wss = new WebSocketServer({ noServer: true });
 
   // Handle HTTP upgrade events manually
   server.on('upgrade', (request, socket, head) => {
     const { pathname } = parse(request.url, true);
 
-    // Only handle upgrades to /ws path — let Next.js handle its own (/_next/*)
+    // Only handle upgrades to /ws path
     if (pathname === '/ws') {
       wss.handleUpgrade(request, socket, head, (ws) => {
         wss.emit('connection', ws, request);
       });
     }
-    // For any other path (like /_next/webpack-hmr), do NOT handle it here
-    // Next.js will handle its own HMR WebSocket connections
   });
 
   wss.on('connection', (ws) => {
     console.log('🔌 New WebSocket connection');
 
-    ws.on('message', (data) => {
+    ws.on('message', async (data) => {
       try {
         const message = JSON.parse(data.toString());
         console.log('📨 Received:', message.type);
@@ -127,13 +122,14 @@ app.prepare().then(() => {
             clients.set(ws, { userId, userName, role });
             console.log(`✅ ${userName} connected as ${role}`);
 
-            // Send current requests list
+            // Send current requests list from database
+            const allRequests = await prisma.approvalRequest.findMany({
+              orderBy: { createdAt: 'desc' },
+            });
             ws.send(
               JSON.stringify({
                 type: 'requests-list',
-                payload: [...requests].sort(
-                  (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
-                ),
+                payload: allRequests,
               })
             );
             break;
@@ -142,17 +138,9 @@ app.prepare().then(() => {
           // Maker creates a new request
           case 'new-request': {
             const { title, description, amount, createdBy } = message.payload;
-            const newRequest = {
-              id: uuidv4(),
-              title,
-              description,
-              amount,
-              status: 'pending',
-              createdBy,
-              createdAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString(),
-            };
-            requests.push(newRequest);
+            const newRequest = await prisma.approvalRequest.create({
+              data: { title, description, amount, createdBy },
+            });
             console.log(`📝 New request created: ${title}`);
 
             // Broadcast to all connected clients
@@ -176,32 +164,34 @@ app.prepare().then(() => {
           // Approver approves a request
           case 'approve-request': {
             const { requestId, approvedBy, comment } = message.payload;
-            const index = requests.findIndex((r) => r.id === requestId);
-            if (index !== -1) {
-              requests[index] = {
-                ...requests[index],
-                status: 'approved',
-                approvedBy,
-                comment: comment || '',
-                updatedAt: new Date().toISOString(),
-              };
-              console.log(`✅ Request approved: ${requests[index].title}`);
+            try {
+              const updated = await prisma.approvalRequest.update({
+                where: { id: requestId },
+                data: {
+                  status: 'approved',
+                  approvedBy,
+                  comment: comment || '',
+                },
+              });
+              console.log(`✅ Request approved: ${updated.title}`);
 
               // Broadcast update to all clients
               broadcast({
                 type: 'request-updated',
-                payload: requests[index],
+                payload: updated,
               });
 
               // Notify the maker
-              broadcastToUser(requests[index].createdBy, {
+              broadcastToUser(updated.createdBy, {
                 type: 'notification',
                 payload: {
-                  message: `✅ คำขอ "${requests[index].title}" ได้รับอนุมัติจาก ${approvedBy}`,
+                  message: `✅ คำขอ "${updated.title}" ได้รับอนุมัติจาก ${approvedBy}`,
                   type: 'success',
                   requestId,
                 },
               });
+            } catch (err) {
+              console.error('Error approving request:', err);
             }
             break;
           }
@@ -209,32 +199,34 @@ app.prepare().then(() => {
           // Approver rejects a request
           case 'reject-request': {
             const reqPayload = message.payload;
-            const idx = requests.findIndex((r) => r.id === reqPayload.requestId);
-            if (idx !== -1) {
-              requests[idx] = {
-                ...requests[idx],
-                status: 'rejected',
-                approvedBy: reqPayload.approvedBy,
-                comment: reqPayload.comment || '',
-                updatedAt: new Date().toISOString(),
-              };
-              console.log(`❌ Request rejected: ${requests[idx].title}`);
+            try {
+              const updated = await prisma.approvalRequest.update({
+                where: { id: reqPayload.requestId },
+                data: {
+                  status: 'rejected',
+                  approvedBy: reqPayload.approvedBy,
+                  comment: reqPayload.comment || '',
+                },
+              });
+              console.log(`❌ Request rejected: ${updated.title}`);
 
               // Broadcast update to all clients
               broadcast({
                 type: 'request-updated',
-                payload: requests[idx],
+                payload: updated,
               });
 
               // Notify the maker
-              broadcastToUser(requests[idx].createdBy, {
+              broadcastToUser(updated.createdBy, {
                 type: 'notification',
                 payload: {
-                  message: `❌ คำขอ "${requests[idx].title}" ถูกปฏิเสธจาก ${reqPayload.approvedBy}`,
+                  message: `❌ คำขอ "${updated.title}" ถูกปฏิเสธจาก ${reqPayload.approvedBy}`,
                   type: 'error',
                   requestId: reqPayload.requestId,
                 },
               });
+            } catch (err) {
+              console.error('Error rejecting request:', err);
             }
             break;
           }
@@ -301,6 +293,7 @@ app.prepare().then(() => {
     console.log(`
   🚀 Server ready on http://${hostname}:${port}
   📡 WebSocket server running on ws://${hostname}:${port}/ws
+  💾 Database: Prisma + SQLite (prisma/dev.db)
     `);
   });
 });

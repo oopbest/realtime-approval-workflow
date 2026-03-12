@@ -56,7 +56,9 @@ export default function RequestCard({
         </span>
       </div>
 
-      <p className="request-description">{request.description}</p>
+      <p className="request-description" style={{ whiteSpace: 'pre-wrap' }}>
+        {request.description}
+      </p>
 
       <div className="request-meta">
         <div className="meta-item">
